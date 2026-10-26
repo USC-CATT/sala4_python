@@ -603,10 +603,12 @@ class HostAugmentedPWMPositionController:
             acc=Axis3f(),
         )
         self.cf_sensors = SensorData(gyro=GyroData(), acc=AccData())
+        self.motor_m1_erpm = 0
+        self.motor_m3_erpm = 0
         self.cf_vbat = 4.2
         self._have_state = False
         self._have_sensor = False
-        self.display = LiveDisplay()
+        # self.display = LiveDisplay()
 
         if USE_SCRIPT_TRAJECTORY:
             _validate_trajectory()
@@ -645,6 +647,8 @@ class HostAugmentedPWMPositionController:
         self.log_state.add_variable("stateEstimate.roll", "FP16")
         self.log_state.add_variable("stateEstimate.yaw", "FP16")
         self.log_state.add_variable("pm.vbat", "FP16")
+        self.log_state.add_variable("motor.m1_erpm", "FP16")
+        self.log_state.add_variable("motor.m3_erpm", "FP16")
 
         # self.log_sensor = LogConfig(name="HostAugSensor", period_in_ms=60)
         # self.log_sensor.add_variable("gyro.x", "float")
@@ -700,7 +704,7 @@ class HostAugmentedPWMPositionController:
             try:
                 self.cf.log.add_config(self.log_state)
                 self.log_state.data_received_cb.add_callback(self._log_state_callback)
-                self.log_state.data_received_cb.add_callback(self.display.log_callback)
+                # self.log_state.data_received_cb.add_callback(self.display.log_callback)
                 # self.cf.log.add_config(self.log_sensor)
                 # self.log_sensor.data_received_cb.add_callback(self._log_sensor_callback)
 
@@ -737,7 +741,7 @@ class HostAugmentedPWMPositionController:
                 if logs_started:
                     self.log_state.stop()
                     # self.log_sensor.stop()
-                self.display.close()
+                # self.display.close()
                 with open(WAYPOINT_DATA_PATH, "w", encoding="utf-8") as json_file:
                     json.dump(json_data, json_file, indent=4)
 
@@ -948,6 +952,9 @@ class HostAugmentedPWMPositionController:
         self.cf_sensors.gyro.x = data["gyro.x"]
         self.cf_sensors.gyro.y = data["gyro.y"]
         self.cf_sensors.gyro.z = data["gyro.z"]
+        
+        self.motor_m1_erpm = data["motor.m1_erpm"]
+        self.motor_m3_erpm = data["motor.m3_erpm"]
         self.cf_vbat = data["pm.vbat"]
 
         self._have_state = True
