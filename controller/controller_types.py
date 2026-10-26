@@ -89,6 +89,12 @@ class SensorData:
     gyro: GyroData = field(default_factory=GyroData)
     acc: AccData = field(default_factory=AccData)
 
+@dataclass
+class MotorThrust:
+    motor_1: float = 0.0
+    motor_2: float = 0.0
+    motor_3: float = 0.0
+    motor_4: float = 0.0
 
 @dataclass
 class Position:

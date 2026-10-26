@@ -1,0 +1,5 @@
+rosbag*
+cache
+*.pyc
+
+*/__pycache__/*

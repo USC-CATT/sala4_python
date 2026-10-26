@@ -116,11 +116,12 @@ from controller.controller_types import (
     StabMode,
     State,
     Velocity,
+    MotorThrust,
     cap_angle,
 )
 from controller.pid import constrain
 from controller.position_controller import PositionController
-from live_display import LiveDisplay
+from telemetry import Telemetry
 from motorRaw import MotorRaw
 
 logging.basicConfig(level=logging.ERROR)
@@ -155,12 +156,6 @@ SCRIPT_TRAJECTORY = [
 ]
 
 
-@dataclass
-class MotorThrust:
-    motor_1: float = 0.0
-    motor_2: float = 0.0
-    motor_3: float = 0.0
-    motor_4: float = 0.0
 
 
 def _validate_trajectory() -> None:
@@ -608,7 +603,8 @@ class HostAugmentedPWMPositionController:
         self.cf_vbat = 4.2
         self._have_state = False
         self._have_sensor = False
-        # self.display = LiveDisplay()
+        self.motor_sent_thrust = MotorThrust()
+        self.telemetry = Telemetry()
 
         if USE_SCRIPT_TRAJECTORY:
             _validate_trajectory()
@@ -704,10 +700,7 @@ class HostAugmentedPWMPositionController:
             try:
                 self.cf.log.add_config(self.log_state)
                 self.log_state.data_received_cb.add_callback(self._log_state_callback)
-                # self.log_state.data_received_cb.add_callback(self.display.log_callback)
-                # self.cf.log.add_config(self.log_sensor)
-                # self.log_sensor.data_received_cb.add_callback(self._log_sensor_callback)
-
+                
                 self.log_state.start()
                 # self.log_sensor.start()
                 logs_started = True
@@ -741,7 +734,7 @@ class HostAugmentedPWMPositionController:
                 if logs_started:
                     self.log_state.stop()
                     # self.log_sensor.stop()
-                # self.display.close()
+                self.telemetry.close()
                 with open(WAYPOINT_DATA_PATH, "w", encoding="utf-8") as json_file:
                     json.dump(json_data, json_file, indent=4)
 
@@ -852,11 +845,17 @@ class HostAugmentedPWMPositionController:
             self.m1_multiplier = REDUCE_MULTIPLIER
             # self.m2_multiplier = REDUCE_MULTIPLIER
 
-        self.motor_raw.send_motor_raw(
+        self.motor_sent_thrust = MotorThrust(
             int(pwm.motor_1 * self.m1_multiplier),
             int(pwm.motor_2 * self.m2_multiplier),
             int(pwm.motor_3 * self.m3_multiplier),
             int(pwm.motor_4 * self.m4_multiplier),
+        )
+        self.motor_raw.send_motor_raw(
+            self.motor_sent_thrust.motor_1,
+            self.motor_sent_thrust.motor_2,
+            self.motor_sent_thrust.motor_3,
+            self.motor_sent_thrust.motor_4,
         )
 
     def _power_distributor(self, control: Control, motor_thrust: MotorThrust):
@@ -952,10 +951,22 @@ class HostAugmentedPWMPositionController:
         self.cf_sensors.gyro.x = data["gyro.x"]
         self.cf_sensors.gyro.y = data["gyro.y"]
         self.cf_sensors.gyro.z = data["gyro.z"]
-        
+
         self.motor_m1_erpm = data["motor.m1_erpm"]
         self.motor_m3_erpm = data["motor.m3_erpm"]
         self.cf_vbat = data["pm.vbat"]
+
+        try:
+            self.telemetry.update_state(
+                position=self.cf_state.position,
+                velocity=self.cf_state.velocity,
+                attitude=self.cf_state.attitude,
+                gyro=self.cf_sensors.gyro,
+                battery=self.cf_vbat,
+                setpoint=self.cf_setpoint,
+            )
+        except Exception:
+            pass
 
         self._have_state = True
         self._have_sensor = True

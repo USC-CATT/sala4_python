@@ -6,7 +6,38 @@ This bypasses the firmware flight controller by enabling `motorPowerSet.enable`
 and publishing motor commands on the raw motor CRTP port.
 """
 
-HOVER_HEIGHT = .85
+import argparse
+import json
+import logging
+import math
+import os
+import sys
+import time
+from dataclasses import dataclass
+from typing import Tuple
+
+import numpy as np
+from pynput import keyboard
+from controller.controller_pid import ControllerPID
+from controller.controller_types import (
+    AccData,
+    Attitude,
+    AttitudeRate,
+    Axis3f,
+    Control,
+    GyroData,
+    Position,
+    SensorData,
+    Setpoint,
+    SetpointMode,
+    StabMode,
+    State,
+    MotorThrust,
+    Velocity,
+)
+from telemetry import Telemetry
+from motorRaw import MotorRaw
+HOVER_HEIGHT = 0.85
 # User-editable trajectory block.
 # Edit this list directly to define the desired path.
 # Each tuple is: (time_s, x_m, y_m, z_m, yaw_deg)
@@ -21,18 +52,6 @@ USER_DEFINED_TRAJECTORY = [
 ]
 # after the last waypoint, there will be a default landing to z=0.05m in three seconds if --no-land is not specified, regardless of the last waypoint's z value
 
-import argparse
-import json
-import logging
-import math
-import os
-import sys
-import time
-from dataclasses import dataclass
-from typing import Tuple
-
-import numpy as np
-from pynput import keyboard
 
 # Ensure local imports work no matter where the script is launched from.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -55,26 +74,6 @@ except ModuleNotFoundError as exc:
         ) from exc
     raise
 
-from controller.controller_pid import ControllerPID
-from controller.controller_types import (
-    AccData,
-    Attitude,
-    AttitudeRate,
-    Axis3f,
-    Control,
-    GyroData,
-    Position,
-    Quaternion,
-    SensorData,
-    Setpoint,
-    SetpointMode,
-    StabMode,
-    State,
-    Velocity,
-    quat2rpy,
-)
-from live_display import LiveDisplay
-from motorRaw import MotorRaw
 
 logging.basicConfig(level=logging.ERROR)
 
@@ -107,12 +106,6 @@ SCRIPT_TRAJECTORY = [
 ]
 
 
-@dataclass
-class MotorThrust:
-    motor_1: float = 0.0
-    motor_2: float = 0.0
-    motor_3: float = 0.0
-    motor_4: float = 0.0
 
 
 def _validate_trajectory() -> None:
@@ -207,10 +200,11 @@ class HostPIDPWMPositionController:
         self.cf_sensors = SensorData(gyro=GyroData(), acc=AccData())
         self.motor_m1_erpm = 0
         self.motor_m3_erpm = 0
+        self.motor_sent_thrust = MotorThrust()
         self.cf_vbat = 4.2
         self._have_state = False
         self._have_sensor = False
-        # self.display = LiveDisplay()
+        self.telemetry = Telemetry()
 
         if USE_SCRIPT_TRAJECTORY:
             _validate_trajectory()
@@ -287,7 +281,6 @@ class HostPIDPWMPositionController:
             try:
                 self.cf.log.add_config(self.log_state)
                 self.log_state.data_received_cb.add_callback(self._log_state_callback)
-                # self.log_state.data_received_cb.add_callback(self.display.log_callback)
 
                 self.log_state.start()
                 logs_started = True
@@ -317,7 +310,7 @@ class HostPIDPWMPositionController:
                 self._stop_motors()
                 if logs_started:
                     self.log_state.stop()
-                # self.display.close()
+                self.telemetry.close()
                 with open(WAYPOINT_DATA_PATH, "w", encoding="utf-8") as json_file:
                     json.dump(json_data, json_file, indent=4)
 
@@ -422,12 +415,19 @@ class HostPIDPWMPositionController:
         pwm = MotorThrust()
         self._power_distribution_cap(compensated, pwm)
 
-        self.motor_raw.send_motor_raw(
+        self.motor_sent_thrust = MotorThrust(
             int(pwm.motor_1 * self.m1_multiplier),
             int(pwm.motor_2 * self.m2_multiplier),
             int(pwm.motor_3 * self.m3_multiplier),
             int(pwm.motor_4 * self.m4_multiplier),
         )
+        self.motor_raw.send_motor_raw(
+            self.motor_sent_thrust.motor_1,
+            self.motor_sent_thrust.motor_2,
+            self.motor_sent_thrust.motor_3,
+            self.motor_sent_thrust.motor_4,
+        )
+
 
     def _power_distributor(self, control: Control, motor_thrust: MotorThrust):
         r = control.roll / 2.0
@@ -527,23 +527,20 @@ class HostPIDPWMPositionController:
         self.motor_m3_erpm = data["motor.m3_erpm"]
         self.cf_vbat = data["pm.vbat"]
 
-        # qx = data["stateEstimate.qx"]
-        # qy = data["stateEstimate.qy"]
-        # qz = data["stateEstimate.qz"]
-        # qw = data["stateEstimate.qw"]
-        # q = Quaternion(w=qw, x=qx, y=qy, z=qz)
-        # rpy = quat2rpy(q)
-        # self.cf_state.attitude_quaternion.x = qx
-        # self.cf_state.attitude_quaternion.y = qy
-        # self.cf_state.attitude_quaternion.z = qz
-        # self.cf_state.attitude_quaternion.w = qw
-
-        # self.cf_state.attitude.roll = np.degrees(rpy.x)
-        # self.cf_state.attitude.pitch = np.degrees(rpy.y)
-        # self.cf_state.attitude.yaw = np.degrees(rpy.z)
-
         self._have_state = True
         self._have_sensor = True
+
+        try:
+            self.telemetry.update_state(
+                position=self.cf_state.position,
+                velocity=self.cf_state.velocity,
+                attitude=self.cf_state.attitude,
+                gyro=self.cf_sensors.gyro,
+                battery=self.cf_vbat,
+                setpoint=self.cf_setpoint,
+            )
+        except Exception:
+            pass
 
     def _log_sensor_callback(self, _timestamp, data, _logconf):
         self._have_sensor = True

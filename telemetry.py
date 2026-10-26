@@ -1,31 +1,43 @@
 #!/usr/bin/env python3
-"""Lightweight live telemetry display for host-side Crazyflie controllers.
+"""Lightweight live telemetry display for host-side Crazyflie controllers."""
 
-Attaches directly to a cflib LogConfig callback or accepts individual
-telemetry snapshots. Shows a 3D flight box, a numeric telemetry panel,
-and a battery gauge.
+from multiprocessing import Process, Queue, Event
+from queue import Empty, Full
 
-Usage from a controller:
-
-    from live_display import LiveDisplay
-
-    display = LiveDisplay()
-    self.log_state.data_received_cb.add_callback(display.log_callback)
-    ...
-    display.close()
-
-Every datapoint is optional; only push what you have.
-"""
-
-import threading
+import math
+from controller.controller_types import (
+    AccData,
+    Attitude,
+    AttitudeRate,
+    Axis3f,
+    Control,
+    GyroData,
+    Position,
+    SensorData,
+    Setpoint,
+    SetpointMode,
+    StabMode,
+    State,
+    Velocity,
+    MotorThrust,
+)
 import time
 from collections import deque
-from typing import Optional, Tuple
+from typing import Optional
 
 try:
     import matplotlib
 
-    matplotlib.use("TkAgg")
+    try:
+        matplotlib.use("QtAgg")
+    except Exception:
+        try:
+            matplotlib.use("Qt5Agg")
+        except Exception:
+            try:
+                matplotlib.use("TkAgg")
+            except Exception:
+                pass
     import matplotlib.pyplot as plt
 except Exception as exc:
     matplotlib = None
@@ -51,8 +63,6 @@ ACCENT_COLOR = "#facc15"
 
 
 class _NullDisplay:
-    """No-op stand-in used when matplotlib is unavailable."""
-
     def __init__(self, reason: str):
         print(f"[LiveDisplay] Disabled: {reason}")
 
@@ -84,117 +94,89 @@ class _NullDisplay:
         return
 
 
-def LiveDisplay(*args, **kwargs):
-    """Create a live display, falling back to a no-op if matplotlib is missing."""
+def Telemetry(*args, **kwargs):
     if _MATPLOTLIB_IMPORT_ERROR is not None:
         return _NullDisplay(str(_MATPLOTLIB_IMPORT_ERROR))
     return _TelemetryDisplay(*args, **kwargs)
 
 
-class _TelemetryDisplay:
-    """Matplotlib-backed telemetry dashboard updated from log callbacks."""
+def _run_child(queue, stop_event, box_size_m, update_hz, history_s):
+    renderer = _TelemetryRenderer(queue, stop_event, box_size_m, update_hz, history_s)
+    renderer.run()
 
-    def __init__(
-        self,
-        box_size_m: float = BOX_SIZE_M,
-        update_hz: float = UPDATE_HZ,
-        history_s: float = HISTORY_SECONDS,
-    ):
+
+class _TelemetryRenderer:
+    def __init__(self, queue, stop_event, box_size_m, update_hz, history_s):
+        self._queue = queue
+        self._stop = stop_event
         self._half = box_size_m / 2.0
         self._period = 1.0 / max(update_hz, 1.0)
         max_points = max(100, int(history_s * 50))
 
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-
-        self._position: Optional[Tuple[float, float, float]] = None
-        self._velocity: Optional[Tuple[float, float, float]] = None
-        self._attitude: Optional[Tuple[float, float, float]] = None
-        self._gyro: Optional[Tuple[float, float, float]] = None
-        self._setpoint: Optional[Tuple[float, float, float]] = None
-        self._vbat: Optional[float] = None
-        self._last_update: Optional[float] = None
-        self._trail_x: deque = deque(maxlen=max_points)
-        self._trail_y: deque = deque(maxlen=max_points)
-        self._trail_z: deque = deque(maxlen=max_points)
+        self._position = None
+        self._velocity = None
+        self._attitude = None
+        self._gyro = None
+        self._setpoint = None
+        self._thrust = None
+        self._vbat = None
+        self._last_update = None
+        self._trail_x = deque(maxlen=max_points)
+        self._trail_y = deque(maxlen=max_points)
+        self._trail_z = deque(maxlen=max_points)
 
         self._fig = None
 
-        self._thread = threading.Thread(target=self._gui_main, daemon=True)
-        self._thread.start()
-
-    def log_callback(self, _timestamp, data, _logconf):
-        """cflib LogConfig callback; accepts the raw log data dict."""
-        try:
-            position = self._triple(data, "stateEstimate.x", "stateEstimate.y", "stateEstimate.z")
-            velocity = self._triple(data, "stateEstimate.vx", "stateEstimate.vy", "stateEstimate.vz")
-            attitude = self._triple(data, "stateEstimate.roll", "stateEstimate.pitch", "stateEstimate.yaw")
-            gyro = self._triple(data, "gyro.x", "gyro.y", "gyro.z")
-        except KeyError:
+    def run(self):
+        self._build_figure()
+        if self._fig is None:
+            self._stop.wait()
             return
-        self.update_state(
-            position=position,
-            velocity=velocity,
-            attitude=attitude,
-            gyro=gyro,
-            battery=data.get("pm.vbat"),
-        )
+        plt.show(block=False)
+        while not self._stop.wait(self._period):
+            self._drain()
+            try:
+                self._render()
+            except Exception:
+                pass
+        try:
+            plt.close(self._fig)
+        except Exception:
+            pass
 
-    def update_state(
-        self,
-        position: Optional[Tuple[float, float, float]] = None,
-        velocity: Optional[Tuple[float, float, float]] = None,
-        attitude: Optional[Tuple[float, float, float]] = None,
-        gyro: Optional[Tuple[float, float, float]] = None,
-        battery: Optional[float] = None,
-        setpoint: Optional[Tuple[float, float, float]] = None,
-    ) -> None:
-        with self._lock:
-            if position is not None:
-                self._position = position
-                self._trail_x.append(position[0])
-                self._trail_y.append(position[1])
-                self._trail_z.append(position[2])
-            if velocity is not None:
-                self._velocity = velocity
-            if attitude is not None:
-                self._attitude = attitude
-            if gyro is not None:
-                self._gyro = gyro
-            if battery is not None:
-                self._vbat = battery
-            if setpoint is not None:
-                self._setpoint = setpoint
-            self._last_update = time.monotonic()
+    def _drain(self):
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except Empty:
+                break
+            if item is None:
+                self._stop.set()
+                return
+            self._apply(item)
 
-    def update_position(self, x: float, y: float, z: float) -> None:
-        self.update_state(position=(x, y, z))
+    def _apply(self, data):
+        if data.get("position") is not None:
+            p = data["position"]
+            self._position = p
+            self._trail_x.append(p.x)
+            self._trail_y.append(p.y)
+            self._trail_z.append(p.z)
+        if data.get("velocity") is not None:
+            self._velocity = data["velocity"]
+        if data.get("attitude") is not None:
+            self._attitude = data["attitude"]
+        if data.get("gyro") is not None:
+            self._gyro = data["gyro"]
+        if data.get("thrust") is not None:
+            self._thrust = data["thrust"]
+        if data.get("battery") is not None:
+            self._vbat = data["battery"]
+        if data.get("setpoint") is not None:
+            self._setpoint = data["setpoint"]
+        self._last_update = time.monotonic()
 
-    def update_velocity(self, vx: float, vy: float, vz: float) -> None:
-        self.update_state(velocity=(vx, vy, vz))
-
-    def update_attitude(self, roll: float, pitch: float, yaw: float) -> None:
-        self.update_state(attitude=(roll, pitch, yaw))
-
-    def update_gyro(self, gx: float, gy: float, gz: float) -> None:
-        self.update_state(gyro=(gx, gy, gz))
-
-    def update_battery(self, vbat: float) -> None:
-        self.update_state(battery=vbat)
-
-    def update_setpoint(self, x: float, y: float, z: float) -> None:
-        self.update_state(setpoint=(x, y, z))
-
-    def close(self) -> None:
-        self._stop.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-
-    @staticmethod
-    def _triple(data, key_x: str, key_y: str, key_z: str):
-        return (data[key_x], data[key_y], data[key_z])
-
-    def _build_figure(self) -> None:
+    def _build_figure(self):
         try:
             plt.ion()
             fig = plt.figure(figsize=(12.5, 6.5), facecolor=BG_COLOR)
@@ -274,48 +256,29 @@ class _TelemetryDisplay:
             fontsize=11, color=FG_COLOR, verticalalignment="center", horizontalalignment="right",
         )
 
-    def _gui_main(self) -> None:
-        self._build_figure()
-        if self._fig is None:
-            self._stop.wait()
-            return
-        try:
-            plt.show(block=False)
-            while not self._stop.wait(self._period):
-                try:
-                    self._render()
-                except Exception:
-                    pass
-        finally:
-            try:
-                plt.close(self._fig)
-            except Exception:
-                pass
-
-    def _render(self) -> None:
-        with self._lock:
-            position = self._position
-            velocity = self._velocity
-            attitude = self._attitude
-            gyro = self._gyro
-            setpoint = self._setpoint
-            vbat = self._vbat
-            last_update = self._last_update
-            trail = (list(self._trail_x), list(self._trail_y), list(self._trail_z))
+    def _render(self):
+        position = self._position
+        velocity = self._velocity
+        attitude = self._attitude
+        gyro = self._gyro
+        setpoint = self._setpoint
+        vbat = self._vbat
+        last_update = self._last_update
+        trail = (list(self._trail_x), list(self._trail_y), list(self._trail_z))
 
         stale = last_update is None or (time.monotonic() - last_update) > STALE_TIMEOUT_S
 
         self._trail_line.set_data(trail[0], trail[1])
         self._trail_line.set_3d_properties(trail[2])
         if position is not None and not stale:
-            self._drone_point.set_data([position[0]], [position[1]])
-            self._drone_point.set_3d_properties([position[2]])
+            self._drone_point.set_data([position.x], [position.y])
+            self._drone_point.set_3d_properties([position.z])
         else:
             self._drone_point.set_data([], [])
             self._drone_point.set_3d_properties([])
         if setpoint is not None:
-            self._setpoint_point.set_data([setpoint[0]], [setpoint[1]])
-            self._setpoint_point.set_3d_properties([setpoint[2]])
+            self._setpoint_point.set_data([setpoint.position.x], [setpoint.position.y])
+            self._setpoint_point.set_3d_properties([setpoint.position.z])
         else:
             self._setpoint_point.set_data([], [])
             self._setpoint_point.set_3d_properties([])
@@ -336,20 +299,35 @@ class _TelemetryDisplay:
         else:
             self._fig.canvas.flush_events()
 
-    def _format_panel(self, position, velocity, attitude, gyro, setpoint, stale: bool) -> str:
+    def _format_panel(self, position, velocity, attitude, gyro, setpoint, stale):
+        def g(obj, name):
+            if obj is None:
+                return None
+            return getattr(obj, name, None)
+
+        px, py, pz = g(position, "x"), g(position, "y"), g(position, "z")
+        vx, vy, vz = g(velocity, "x"), g(velocity, "y"), g(velocity, "z")
+        roll = g(attitude, "roll"); pitch = g(attitude, "pitch"); yaw = g(attitude, "yaw")
+        gx, gy, gz = g(gyro, "x"), g(gyro, "y"), g(gyro, "z")
+
+        sp = None
+        if setpoint is not None:
+            sp = getattr(setpoint, "position", None)
+        sx, sy, sz = g(sp, "x"), g(sp, "y"), g(sp, "z")
+
         rows = [
             "  POSITION (m)        VELOCITY (m/s)",
-            f"  x  {self._fmt(position, 0)}   vx  {self._fmt(velocity, 0)}",
-            f"  y  {self._fmt(position, 1)}   vy  {self._fmt(velocity, 1)}",
-            f"  z  {self._fmt(position, 2)}   vz  {self._fmt(velocity, 2)}",
+            f"  x  {self._fmt(px)}   vx  {self._fmt(vx)}",
+            f"  y  {self._fmt(py)}   vy  {self._fmt(vy)}",
+            f"  z  {self._fmt(pz)}   vz  {self._fmt(vz)}",
             "",
             "  ATTITUDE (deg)      GYRO (deg/s)",
-            f"  roll  {self._fmt(attitude, 0)}   gx  {self._fmt(gyro, 0)}",
-            f"  pitch {self._fmt(attitude, 1)}   gy  {self._fmt(gyro, 1)}",
-            f"  yaw   {self._fmt(attitude, 2)}   gz  {self._fmt(gyro, 2)}",
+            f"  roll  {self._fmt(roll)}   gx  {self._fmt(gx)}",
+            f"  pitch {self._fmt(pitch)}   gy  {self._fmt(gy)}",
+            f"  yaw   {self._fmt(yaw)}   gz  {self._fmt(gz)}",
             "",
             "  SETPOINT (m)",
-            f"  x  {self._fmt(setpoint, 0)}    y  {self._fmt(setpoint, 1)}    z  {self._fmt(setpoint, 2)}",
+            f"  x  {self._fmt(sx)}    y  {self._fmt(sy)}    z  {self._fmt(sz)}",
         ]
         if stale:
             rows.append("")
@@ -357,13 +335,13 @@ class _TelemetryDisplay:
         return "\n".join(rows)
 
     @staticmethod
-    def _fmt(values: Optional[Tuple[float, float, float]], index: int) -> str:
-        if values is None:
+    def _fmt(value):
+        if value is None:
             return "  ---  "
-        return f"{values[index]:+7.2f}"
+        return f"{value:+7.2f}"
 
     @staticmethod
-    def _battery_color(vbat: float) -> str:
+    def _battery_color(vbat):
         if vbat >= 3.9:
             return "#4ade80"
         if vbat >= 3.6:
@@ -371,19 +349,74 @@ class _TelemetryDisplay:
         return "#f87171"
 
 
-def _demo() -> None:
-    display = LiveDisplay()
+class _TelemetryDisplay:
+    def __init__(self, box_size_m=BOX_SIZE_M, update_hz=UPDATE_HZ, history_s=HISTORY_SECONDS):
+        self._queue = Queue()
+        self._stop = Event()
+        self._process = Process(target=_run_child, args=(self._queue, self._stop, box_size_m, update_hz, history_s), daemon=True)
+        self._process.start()
+
+    def update_state(self, position=None, velocity=None, attitude=None, thrust=None,
+                     gyro=None, battery=None, setpoint=None):
+        try:
+            self._queue.put_nowait({
+                "position": position,
+                "velocity": velocity,
+                "attitude": attitude,
+                "thrust": thrust,
+                "gyro": gyro,
+                "battery": battery,
+                "setpoint": setpoint,
+            })
+        except Full:
+            pass
+
+    def update_position(self, x, y, z):
+        self.update_state(position=Position(x, y, z))
+
+    def update_velocity(self, vx, vy, vz):
+        self.update_state(velocity=Velocity(vx, vy, vz))
+
+    def update_attitude(self, roll, pitch, yaw):
+        self.update_state(attitude=Attitude(roll, pitch, yaw))
+
+    def update_gyro(self, gx, gy, gz):
+        self.update_state(gyro=GyroData(gx, gy, gz))
+
+    def update_battery(self, vbat):
+        self.update_state(battery=vbat)
+
+    def update_setpoint(self, x, y, z):
+        self.update_state(setpoint=Setpoint(Position(x, y, z)))
+
+    @staticmethod
+    def triple(data, key_x, key_y, key_z):
+        return (data[key_x], data[key_y], data[key_z])
+
+    def close(self):
+        try:
+            self._queue.put(None)
+        except Exception:
+            pass
+        self._stop.set()
+        if self._process.is_alive():
+            self._process.join(timeout=2.0)
+
+
+def _demo():
+
+    display = Telemetry()
     try:
         t0 = time.monotonic()
         while True:
             t = time.monotonic() - t0
             display.update_state(
-                position=(0.8 * math.cos(0.5 * t), 0.8 * math.sin(0.5 * t), 0.8 + 0.1 * math.sin(t)),
-                velocity=(-0.4 * math.sin(0.5 * t), 0.4 * math.cos(0.5 * t), 0.1 * math.cos(t)),
-                attitude=(5.0 * math.sin(0.5 * t), -5.0 * math.cos(0.5 * t), t * 5.0 % 360.0),
-                gyro=(10.0 * math.cos(0.5 * t), 10.0 * math.sin(0.5 * t), 2.0),
+                position=Position(0.8 * math.cos(0.5 * t), 0.8 * math.sin(0.5 * t), 0.8 + 0.1 * math.sin(t)),
+                velocity=Velocity(-0.4 * math.sin(0.5 * t), 0.4 * math.cos(0.5 * t), 0.1 * math.cos(t)),
+                attitude=Attitude(5.0 * math.sin(0.5 * t), -5.0 * math.cos(0.5 * t), t * 5.0 % 360.0),
+                gyro=GyroData(10.0 * math.cos(0.5 * t), 10.0 * math.sin(0.5 * t), 2.0),
                 battery=4.2 - 0.0001 * t,
-                setpoint=(0.8, 0.0, 0.85),
+                setpoint=Setpoint(Position(0.8, 0.0, 0.85)),
             )
             time.sleep(0.04)
     except KeyboardInterrupt:
@@ -393,6 +426,4 @@ def _demo() -> None:
 
 
 if __name__ == "__main__":
-    import math
-
     _demo()
