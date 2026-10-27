@@ -1,8 +1,8 @@
 # Trajectory Plotting
 
-`host_pid_pwm_position.py` stores the position and setpoint of the drone at each control iteration and stores it in a json object, and then saves that object to a file:
+`host_pwm_position.py` stores the controller's logging data (position, setpoint, roll/pitch/yaw output, and `v_aug_*` for the augmented controller) at each control iteration in a json object, and then saves that object to a file:
 
-`waypoint_data.json` is created at the end of the waypoint running in `host_pid_pwm_position.py` and contains the x,y,z points of the position and setpoint of the drone
+`waypoint_data.json` is created at the end of the waypoint running in `host_pwm_position.py` and contains the x,y,z points of the position and setpoint of the drone. It is overwritten on every run, so rename it before running the other controller if you want to compare PID and augmented flights.
 
 `plot_data.py` contains all logic necessary to plot two drone trajectories or just one. It has the following parameters:
 

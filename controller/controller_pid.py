@@ -5,7 +5,9 @@ Based on controller_pid.c from Crazyflie firmware
 Copyright (C) 2011-2012 Bitcraze AB
 """
 
-from typing import Optional
+from typing import Optional, Dict, Tuple
+
+from .controller_interface import ControllerInterface
 
 from .attitude_controller import AttitudeController
 from .position_controller import PositionController
@@ -28,10 +30,10 @@ from .controller_types import (
 )
 
 
-class ControllerPID:
+class ControllerPID(ControllerInterface):
     """Main PID controller for Crazyflie"""
 
-    def __init__(self):
+    def __init__(self, loop_hz: float):
         """Initialize PID controller"""
         self.attitude_desired = Attitude()
         self.rate_desired = Attitude()
@@ -46,17 +48,25 @@ class ControllerPID:
         self.r_pitch = 0.0
         self.r_yaw = 0.0
 
-        # Sub-controllers
-        self.attitude_controller: Optional[AttitudeController] = None
-        self.position_controller: Optional[PositionController] = None
-
         # Update rate
         self.attitude_update_dt = 1.0 / ATTITUDE_RATE
+
+        # Sub-controllers
+        self.attitude_controller = AttitudeController(self.attitude_update_dt)
+        self.position_controller = PositionController()
+
+
+        # Stabilizer step
+        self.stabilizer_step = 1
+
+        # Persistent control for logging
+        self.control = Control()
 
     def init(self):
         """Initialize the controller and sub-controllers"""
         self.attitude_controller = AttitudeController(self.attitude_update_dt)
         self.position_controller = PositionController()
+        self.stabilizer_step = 1
 
     def test(self) -> bool:
         """
@@ -69,31 +79,32 @@ class ControllerPID:
             return False
         return self.attitude_controller.test()
 
-    def controller_pid(
+    def reset(self, state: State):
+        self.attitude_controller = AttitudeController(self.attitude_update_dt)
+        self.position_controller = PositionController()
+        self.stabilizer_step = 1
+
+    def step(
         self,
-        control: Control,
         setpoint: Setpoint,
         sensors: SensorData,
         state: State,
-        stabilizer_step: int,
-    ):
+        sim_time: float
+    ) -> Tuple[Control, Dict[str, float]]:
         """
         Main PID controller update
 
         Args:
-            control: Control output (modified in place)
             setpoint: Desired setpoint
             sensors: Sensor data
             state: Current state estimate
-            stabilizer_step: Current stabilizer step for rate limiting
+            sim_time: Current simulation time
         """
-        if self.attitude_controller is None or self.position_controller is None:
-            return
 
-        control.control_mode = ControlMode.CONTROL_MODE_LEGACY
+        self.control.control_mode = ControlMode.CONTROL_MODE_LEGACY
 
         # Update at ATTITUDE_RATE
-        if rate_do_execute(ATTITUDE_RATE, stabilizer_step):
+        if rate_do_execute(ATTITUDE_RATE, self.stabilizer_step):
             # Rate-controlled YAW is moving YAW angle setpoint
             if setpoint.mode.yaw == StabMode.MODE_VELOCITY:
                 self.attitude_desired.yaw = cap_angle(
@@ -127,7 +138,7 @@ class ControllerPID:
             self.attitude_desired.yaw = cap_angle(self.attitude_desired.yaw)
 
         # Update position controller at POSITION_RATE
-        if rate_do_execute(POSITION_RATE, stabilizer_step):
+        if rate_do_execute(POSITION_RATE, self.stabilizer_step):
             thrust, attitude_desired = self.position_controller.position_controller(
                 setpoint, state
             )
@@ -138,7 +149,7 @@ class ControllerPID:
             # Note: yaw is handled separately above
 
         # Update attitude controller at ATTITUDE_RATE
-        if rate_do_execute(ATTITUDE_RATE, stabilizer_step):
+        if rate_do_execute(ATTITUDE_RATE, self.stabilizer_step):
             # Switch between manual and automatic position control
             if setpoint.mode.z == StabMode.MODE_DISABLE:
                 self.actuator_thrust = setpoint.thrust
@@ -189,33 +200,33 @@ class ControllerPID:
                 self.attitude_controller.get_actuator_output()
             )
 
-            control.roll = roll_out
-            control.pitch = pitch_out
-            control.yaw = -yaw_out  # Negate yaw output
+            self.control.roll = roll_out
+            self.control.pitch = pitch_out
+            self.control.yaw = -yaw_out  # Negate yaw output
 
             # Update logging variables
-            self.cmd_thrust = control.thrust
-            self.cmd_roll = control.roll
-            self.cmd_pitch = control.pitch
-            self.cmd_yaw = control.yaw
+            self.cmd_thrust = self.control.thrust
+            self.cmd_roll = self.control.roll
+            self.cmd_pitch = self.control.pitch
+            self.cmd_yaw = self.control.yaw
             self.r_roll = radians(sensors.gyro.x)
             self.r_pitch = -radians(sensors.gyro.y)
             self.r_yaw = radians(sensors.gyro.z)
 
         # Set thrust
-        control.thrust = self.actuator_thrust
+        self.control.thrust = self.actuator_thrust
 
         # Handle zero thrust case (safety)
-        if control.thrust == 0:
-            control.thrust = 0
-            control.roll = 0
-            control.pitch = 0
-            control.yaw = 0
+        if self.control.thrust == 0:
+            self.control.thrust = 0
+            self.control.roll = 0
+            self.control.pitch = 0
+            self.control.yaw = 0
 
-            self.cmd_thrust = control.thrust
-            self.cmd_roll = control.roll
-            self.cmd_pitch = control.pitch
-            self.cmd_yaw = control.yaw
+            self.cmd_thrust = self.control.thrust
+            self.cmd_roll = self.control.roll
+            self.cmd_pitch = self.control.pitch
+            self.cmd_yaw = self.control.yaw
 
             # Reset all PIDs
             self.attitude_controller.reset_all_pid(
@@ -228,29 +239,9 @@ class ControllerPID:
             # Reset the calculated YAW angle for rate control
             self.attitude_desired.yaw = state.attitude.yaw
 
-    def get_logging_data(self):
-        """
-        Get logging data
+        self.stabilizer_step += 1
+        return self.control, dict()
 
-        Returns:
-            Dictionary with logging variables
-        """
-        return {
-            "cmd_thrust": self.cmd_thrust,
-            "cmd_roll": self.cmd_roll,
-            "cmd_pitch": self.cmd_pitch,
-            "cmd_yaw": self.cmd_yaw,
-            "r_roll": self.r_roll,
-            "r_pitch": self.r_pitch,
-            "r_yaw": self.r_yaw,
-            "actuator_thrust": self.actuator_thrust,
-            "attitude_desired_roll": self.attitude_desired.roll,
-            "attitude_desired_pitch": self.attitude_desired.pitch,
-            "attitude_desired_yaw": self.attitude_desired.yaw,
-            "rate_desired_roll": self.rate_desired.roll,
-            "rate_desired_pitch": self.rate_desired.pitch,
-            "rate_desired_yaw": self.rate_desired.yaw,
-        }
 
 
 # C-style function interfaces for compatibility
@@ -273,7 +264,6 @@ def controller_pid_test() -> bool:
 
 
 def controller_pid(
-    control: Control,
     setpoint: Setpoint,
     sensors: SensorData,
     state: State,
@@ -282,6 +272,7 @@ def controller_pid(
     """Run controller (C-style function)"""
     global _controller_pid_instance
     if _controller_pid_instance is not None:
-        _controller_pid_instance.controller_pid(
-            control, setpoint, sensors, state, stabilizer_step
+        control, _ = _controller_pid_instance.step(
+            setpoint, sensors, state, stabilizer_step
         )
+        return control
