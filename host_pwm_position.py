@@ -242,7 +242,7 @@ class HostPWMPositionController:
         self.cf = Crazyflie(rw_cache="./cache")
         self.motor_raw = MotorRaw(crazyflie=self.cf)
 
-        self.log_state = LogConfig(name="HostState", period_in_ms=40)
+        self.log_state = LogConfig(name="HostState", period_in_ms=80)
         self.log_state.add_variable("stateEstimate.vx", "FP16")
         self.log_state.add_variable("stateEstimate.vy", "FP16")
         self.log_state.add_variable("stateEstimate.vz", "FP16")
@@ -257,7 +257,7 @@ class HostPWMPositionController:
         self.log_state.add_variable("stateEstimate.yaw", "FP16")
         self.log_state.add_variable("pm.vbat", "FP16")
 
-        self.log_rpm = LogConfig(name="HostMotorRPM", period_in_ms=40)
+        self.log_rpm = LogConfig(name="HostMotorRPM", period_in_ms=80)
         self.log_rpm.add_variable("motor.m1_rpm", "uint16_t")
         self.log_rpm.add_variable("motor.m2_rpm", "uint16_t")
         self.log_rpm.add_variable("motor.m3_rpm", "uint16_t")
@@ -568,6 +568,7 @@ class HostPWMPositionController:
         self.motor_m2_rpm = data["motor.m2_rpm"]
         self.motor_m3_rpm = data["motor.m3_rpm"]
         self.motor_m4_rpm = data["motor.m4_rpm"]
+        print(f"{self.motor_m1_rpm} {self.motor_m2_rpm} {self.motor_m3_rpm} {self.motor_m4_rpm}")
 
 
 def parse_args():
