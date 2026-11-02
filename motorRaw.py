@@ -1,22 +1,22 @@
 #!/usr/bin/env python
 """
-Subsystem handling raw motor data communication
-"""
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Int32MultiArray
-from actuator_msgs.msg import Actuators
-import threading
-import collections
-import logging
-import struct
-import json
-import time
-import inspect
-import os
-from datetime import datetime  # <-- was missing entirely
+Subsystem handling raw motor data communication.
 
-from cflib.crtp.crtpstack import CRTPPacket, CRTPPort
+Pure CRTP: it only builds the raw-motor packet (port 0x09, 4 x uint16 PWM) and
+sends it through the Crazyflie link. With a real Crazyradio the packet goes to
+the drone; with a ros:// link (cflib_ros_link.py) the driver converts it to
+motor speeds and publishes it to Gazebo. No ROS code is needed here.
+"""
+import collections
+import inspect
+import json
+import logging
+import os
+import struct
+import time
+from datetime import datetime
+
+from cflib.crtp.crtpstack import CRTPPacket
 from cflib.utils.callbacks import Caller
 
 logger = logging.getLogger(__name__)
@@ -25,25 +25,9 @@ MotorRawPacket = collections.namedtuple("motorRawPacket", ["m1", "m2", "m3", "m4
 MOTOR_RAW_PORT = 0x09
 
 
-class MotorRawNode(Node):
-    def __init__(self, name="motor_raw_node"):
-        super().__init__(name)
-        self._motor_raw_pub = self.create_publisher(Actuators, "motor_raw", 10)
-
-    def publish_motor_raw(self, m1, m2, m3, m4):
-        msg = Actuators()
-        m1 = m1 / 65535.0 * 26180.0
-        m2 = m2 / 65535.0 * 26180.0
-        m3 = m3 / 65535.0 * 26180.0
-        m4 = m4 / 65535.0 * 26180.0
-        print(f"Publishing motor raw: {m1}, {m2}, {m3}, {m4}")
-        msg.velocity = [float(m1), float(m2), float(m3), float(m4)]
-        self._motor_raw_pub.publish(msg)
-
-
 class MotorRaw:
     """
-    Handle localization-related data communication with the Crazyflie
+    Handle raw motor data communication with the Crazyflie
     """
     SETPOINT_CH = 0
     test = False
@@ -59,10 +43,6 @@ class MotorRaw:
             self._cf = crazyflie
             self.receivedLocationPacket = Caller()
             self._cf.add_port_callback(MOTOR_RAW_PORT, self._incoming)
-
-        if not rclpy.ok():
-            rclpy.init()
-        self._node = MotorRawNode()
 
     def save_log(self):
         if self.using_json_log:
@@ -97,7 +77,7 @@ class MotorRaw:
             json.dump(self.data_json, f, indent=4)
 
     def close(self):
-        """Call this explicitly when shutting down (e.g. node destroy / finally block)."""
+        """Call this explicitly when shutting down (e.g. in a finally block)."""
         if self._closed:
             return
         self._closed = True
@@ -114,16 +94,12 @@ class MotorRaw:
             pass
 
     def _incoming(self, packet):
-        print(packet.data)
         if len(packet.data) < 1:
             logger.warning(
                 f"Packet received with incorrect length (length is {len(packet.data)})"
             )
-            return
-        return
 
     def send_motor_raw(self, m1, m2, m3, m4):
-        self._node.publish_motor_raw(m1, m2, m3, m4)
         self.data_json["velocities"].append({
             "m1": m1, "m2": m2, "m3": m3, "m4": m4,
             "timestamp": time.time() - self.start_time

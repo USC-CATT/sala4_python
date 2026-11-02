@@ -27,6 +27,10 @@ WAYPOINT_DATA_PATH = os.path.join(SCRIPT_DIR, "waypoint_data.json")
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+BRINGUP_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, os.pardir, "sala4_bringup"))
+if BRINGUP_DIR not in sys.path:
+    sys.path.insert(0, BRINGUP_DIR)
+
 from controller.controller_augmented_pid import AugmentedCascadeController
 from controller.controller_interface import ControllerInterface
 from controller.controller_pid import ControllerPID
@@ -72,6 +76,7 @@ except ModuleNotFoundError as exc:
         ) from exc
     raise
 
+import rosdriver
 
 # Available controllers, selectable with --controller.
 CONTROLLERS: Dict[str, Type[ControllerInterface]] = {
